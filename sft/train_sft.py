@@ -1,14 +1,17 @@
 import argparse
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import deepspeed
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import get_linear_schedule_with_warmup
 from datasets import load_dataset
+from functools import partial
 
 
 class SFTDataset(Dataset):
@@ -62,24 +65,24 @@ def get_dataset():
     return dataset["train"], dataset["test"]
     
 def collate_fn(batch, tokenizer):
-    # Pad to longest sequence in batch
-    input_ids = [item["input_ids"] for item in batch]
-    attention_mask = [item["attention_mask"] for item in batch]
-    labels = [item["labels"] for item in batch]
+    input_ids = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
+    attention_mask = [torch.tensor(item["attention_mask"], dtype=torch.long) for item in batch]
+    labels = [torch.tensor(item["labels"], dtype=torch.long) for item in batch]
 
-    padded = tokenizer.pad(
-        {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels},
-        return_tensors="pt",
-        padding=True,
-    )
-    # Replace padding token id in labels with -100
-    padded["labels"][padded["labels"] == tokenizer.pad_token_id] = -100
-    return padded
+    # Pad all sequences to the longest in the batch
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
+    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
-    parser.add_argument("--deepspeed_config", type=str, default="ds_config.json")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B")
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--per_device_train_batch_size", type=int, default=4)
@@ -89,9 +92,11 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--eval_steps", type=int, default=500)
+    parser.add_argument("--eval_steps", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default="./sft_qwen_gsm8k")
     parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to a DeepSpeed checkpoint directory to resume from")
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     return args
@@ -109,8 +114,11 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16,
-        trust_remote_code=True
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2"
     )
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False   # mandatory when using gradient checkpointing
 
     # Load datasets
     train_data, val_data = get_dataset()
@@ -126,7 +134,7 @@ def main():
         batch_size=args.per_device_train_batch_size,
         sampler=train_sampler,
         num_workers=4,
-        collate_fn=lambda b: collate_fn(b, tokenizer),
+        collate_fn=partial(collate_fn, tokenizer=tokenizer),
         pin_memory=True,
     )
     val_loader = DataLoader(
@@ -134,7 +142,7 @@ def main():
         batch_size=args.per_device_eval_batch_size,
         sampler=val_sampler,
         num_workers=4,
-        collate_fn=lambda b: collate_fn(b, tokenizer),
+        collate_fn=partial(collate_fn, tokenizer=tokenizer),
         pin_memory=True,
     )
 
@@ -142,8 +150,7 @@ def main():
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
         model=model,
-        model_parameters=model.parameters(),
-        config_params=args.deepspeed_config
+        model_parameters=model.parameters()
     )
 
     # Scheduler (if not fully handled by DeepSpeed config)
@@ -165,12 +172,25 @@ def main():
     else:
         writer = None
 
+    # Resume from checkpoint if requested
+    resume_step = 0
+    if args.resume_from_checkpoint:
+        _, client_state = model_engine.load_checkpoint(args.resume_from_checkpoint)
+        resume_step = client_state.get("global_step", 0)
+        if dist.get_rank() == 0:
+            print(f"Resumed from checkpoint at step {resume_step}")
+
     global_step = 0
     for epoch in range(args.num_epochs):
         train_sampler.set_epoch(epoch)
         model_engine.train()
 
         for step, batch in enumerate(train_loader):
+            # Skip batches already covered by the resumed checkpoint
+            if global_step < resume_step:
+                global_step += 1
+                continue
+
             # Move to device (DeepSpeed handles it automatically via model_engine)
             batch = {k: v.to(model_engine.device) for k, v in batch.items()}
 
@@ -178,18 +198,29 @@ def main():
                                    attention_mask=batch["attention_mask"],
                                    labels=batch["labels"])
             loss = outputs.loss
+            loss_val = loss.item()
             model_engine.backward(loss)
             model_engine.step()
+            del outputs, loss
 
             if scheduler:
                 scheduler.step()
 
             global_step += 1
 
+            # Save checkpoint (include global_step in client state for future resumes)
+            if args.save_steps > 0 and global_step % args.save_steps == 0:
+                model_engine.save_checkpoint(args.output_dir, tag=f"step_{global_step}",
+                                             client_state={"global_step": global_step})
+
             # Logging
             if dist.get_rank() == 0 and global_step % args.logging_steps == 0:
-                writer.add_scalar("train/loss", loss.item(), global_step)
-                print(f"Step {global_step} | Train Loss: {loss.item():.4f}")
+                writer.add_scalar("train/loss", loss_val, global_step)
+                print(f"Step {global_step} | Train Loss: {loss_val:.4f}")
+
+            # Periodically defragment CUDA memory (variable-length batches cause fragmentation)
+            if global_step % args.logging_steps == 0:
+                torch.cuda.empty_cache()
 
             # Validation
             if global_step % args.eval_steps == 0:
@@ -199,12 +230,9 @@ def main():
                     print(f"Step {global_step} | Validation Loss: {val_loss:.4f}")
                 model_engine.train()  # switch back to train mode
 
-            # Save checkpoint
-            if args.save_steps > 0 and global_step % args.save_steps == 0:
-                model_engine.save_checkpoint(args.output_dir, tag=f"step_{global_step}")
-
     # Final save
-    model_engine.save_checkpoint(args.output_dir, tag="final")
+    model_engine.save_checkpoint(args.output_dir, tag="final",
+                                 client_state={"global_step": global_step})
     if dist.get_rank() == 0:
         writer.close()
 
