@@ -1,0 +1,372 @@
+"""
+Evaluate a model on GSM8K and MMLU benchmarks.
+
+Aligns with lm_eval methodology where applicable.
+
+Usage
+-----
+    # GSM8K (0-shot, official test set)
+    python eval/evaluate.py --model_path ./sft_qwen_gsm8k/final --benchmark gsm8k
+
+    # MMLU (5-shot, 57 subjects)
+    python eval/evaluate.py --model_path ./sft_qwen_gsm8k/final --benchmark mmlu
+
+    # Both benchmarks, limit samples for quick check
+    python eval/evaluate.py --model_path ./sft_qwen_gsm8k/final --benchmark gsm8k mmlu \
+        --gsm8k_max_samples 100 --mmlu_max_per_subject 20
+"""
+
+import argparse
+import json
+import os
+from datetime import datetime, timezone
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+from tqdm import tqdm
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+CHOICE_LETTERS = ["A", "B", "C", "D"]
+
+# All 57 MMLU subjects
+MMLU_ALL_SUBJECTS = [
+    "abstract_algebra", "anatomy", "astronomy", "business_ethics",
+    "clinical_knowledge", "college_biology", "college_chemistry",
+    "college_computer_science", "college_mathematics", "college_medicine",
+    "college_physics", "computer_security", "conceptual_physics",
+    "econometrics", "electrical_engineering", "elementary_mathematics",
+    "formal_logic", "global_facts", "high_school_biology",
+    "high_school_chemistry", "high_school_computer_science",
+    "high_school_european_history", "high_school_geography",
+    "high_school_government_and_politics", "high_school_macroeconomics",
+    "high_school_mathematics", "high_school_microeconomics",
+    "high_school_physics", "high_school_psychology", "high_school_statistics",
+    "high_school_us_history", "high_school_world_history", "human_aging",
+    "human_sexuality", "international_law", "jurisprudence",
+    "logical_fallacies", "machine_learning", "management", "marketing",
+    "medical_genetics", "miscellaneous", "moral_disputes",
+    "moral_scenarios", "nutrition", "philosophy", "prehistory",
+    "professional_accounting", "professional_law", "professional_medicine",
+    "professional_psychology", "public_relations", "security_studies",
+    "sociology", "us_foreign_policy", "virology", "world_religions",
+]
+
+
+def _normalize_number(s: str) -> str:
+    """Normalize a numeric answer string for comparison."""
+    s = s.strip().lower()
+    s = s.replace("$", "").replace(",", "").replace("%", "").replace(" ", "")
+
+    if "/" in s and s.count("/") == 1:
+        try:
+            num, denom = s.split("/")
+            s = f"{float(num) / float(denom):.10g}"
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    if "." in s:
+        s = s.rstrip("0")
+        if s.endswith("."):
+            s = s[:-1]
+
+    if s.startswith("."):
+        s = "0" + s
+
+    return s
+
+
+def load_model_and_tokenizer(model_path: str):
+    """Load a model and tokenizer from a local path or HF hub."""
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2",
+        device_map="auto",
+    )
+    model.eval()
+    return model, tokenizer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GSM8K  (0-shot, official test set — 1319 examples)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def evaluate_gsm8k(model, tokenizer, max_samples=None, max_new_tokens=256):
+    """
+    Evaluate GSM8K accuracy using the official test split.
+
+    Uses greedy decoding and extracts the answer after '####' from the
+    generated solution. This matches the standard lm_eval GSM8K metric.
+    """
+    dataset = load_dataset("gsm8k", "main", split="test")
+    if max_samples is not None:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+    correct, total = 0, 0
+    for example in tqdm(dataset, desc="GSM8K"):
+        question = example["question"]
+        # Extract ground-truth answer from the solution
+        gt_solution = example["answer"]
+        if "####" in gt_solution:
+            gt_answer = gt_solution.split("####")[-1].strip()
+        else:
+            gt_answer = gt_solution.strip()
+
+        prompt = f"Problem: {question}\nSolution:\n"
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=768)
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            gen = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=True,
+            )
+        decoded = tokenizer.decode(gen[0], skip_special_tokens=True)
+
+        if "####" in decoded:
+            pred_answer = decoded.split("####")[-1].strip()
+        else:
+            pred_answer = ""
+
+        if _normalize_number(pred_answer) == _normalize_number(gt_answer):
+            correct += 1
+        total += 1
+
+    acc = correct / total if total > 0 else 0.0
+    print(f"GSM8K accuracy: {acc:.4f} ({correct}/{total})")
+    return acc
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MMLU  (5-shot, label-only logprob — matches lm_eval `acc` metric)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _format_mmlu_question(question: str, choices: list[str]) -> str:
+    lines = [question]
+    for letter, choice in zip(CHOICE_LETTERS, choices):
+        lines.append(f"{letter}. {choice}")
+    return "\n".join(lines)
+
+
+def _mmulu_choice_token_ids(tokenizer, prompt: str) -> list[int]:
+    """
+    Return the token IDs that represent A/B/C/D as continuations of *prompt*.
+
+    Encodes ``prompt + letter`` for each letter and takes the single new token
+    that follows the prompt tokens.  Works correctly regardless of whether the
+    tokenizer uses ``"A"`` or ``" A"`` (space-prefixed) after a newline.
+    """
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    ids = []
+    for letter in CHOICE_LETTERS:
+        full_ids = tokenizer.encode(prompt + letter, add_special_tokens=False)
+        diff = full_ids[len(prompt_ids):]
+        if len(diff) != 1:
+            raise RuntimeError(
+                f"Expected 1 token for '{letter}' continuation, got {len(diff)}: {diff}"
+            )
+        ids.append(diff[0])
+    return ids
+
+
+def evaluate_mmlu(
+    model,
+    tokenizer,
+    subjects=None,
+    num_fewshot=5,
+    max_samples_per_subject=None,
+):
+    """
+    Evaluate MMLU multiple-choice accuracy.
+
+    Uses *num_fewshot* examples from the 'dev' split (5 per subject), formatted
+    with the correct answer letter.  Scores each test question by computing
+    log P(answer_letter | prompt) and picking the highest.
+
+    This is equivalent to lm_eval's ``mmlu`` task with ``acc`` metric.
+    """
+    if subjects is None:
+        subjects = MMLU_ALL_SUBJECTS
+
+    dev_set = load_dataset("cais/mmlu", "all", split="dev")
+    test_set = load_dataset("cais/mmlu", "all", split="test")
+
+    all_correct, all_total = 0, 0
+    subject_accuracies = {}
+
+    for subject in subjects:
+        # Few-shot examples for this subject
+        dev_subject = dev_set.filter(lambda x: x["subject"] == subject)
+        dev_examples = list(dev_subject.select(range(min(num_fewshot, len(dev_subject)))))
+
+        # Test examples for this subject
+        test_subject = test_set.filter(lambda x: x["subject"] == subject)
+        if max_samples_per_subject is not None:
+            test_subject = test_subject.select(
+                range(min(max_samples_per_subject, len(test_subject)))
+            )
+
+        correct, total = 0, 0
+        for example in tqdm(test_subject, desc=f"MMLU/{subject}"):
+            question = example["question"]
+            choices = example["choices"]
+            answer_idx = example["answer"]
+
+            # Build few-shot prompt
+            parts = []
+            for dev_ex in dev_examples:
+                parts.append(_format_mmlu_question(dev_ex["question"], dev_ex["choices"]))
+                parts.append(f"Answer: {CHOICE_LETTERS[dev_ex['answer']]}\n")
+
+            test_question_block = _format_mmlu_question(question, choices)
+            parts.append(test_question_block)
+            parts.append("Answer:")
+
+            prompt = "\n".join(parts)
+
+            # Get token IDs for A/B/C/D as the next token after the prompt
+            # (strip trailing "Answer:" to find the continuation token)
+            answer_prefix = "\n".join(parts[:-1]) + "\nAnswer:"
+            choice_token_ids = _mmulu_choice_token_ids(tokenizer, answer_prefix)
+
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+            device = next(model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+                next_logits = outputs.logits[0, -1, :].float()
+
+            choice_logprobs = [
+                F.log_softmax(next_logits, dim=-1)[tid].item()
+                for tid in choice_token_ids
+            ]
+            pred_idx = int(torch.argmax(torch.tensor(choice_logprobs)).item())
+
+            if pred_idx == answer_idx:
+                correct += 1
+            total += 1
+
+        subj_acc = correct / total if total > 0 else 0.0
+        subject_accuracies[subject] = subj_acc
+        all_correct += correct
+        all_total += total
+        print(f"  {subject}: {subj_acc:.4f} ({correct}/{total})")
+
+    overall_acc = all_correct / all_total if all_total > 0 else 0.0
+    print(f"\nMMLU overall accuracy: {overall_acc:.4f} ({all_correct}/{all_total})")
+    return overall_acc, subject_accuracies
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Evaluate a model on GSM8K and MMLU")
+    p.add_argument("--model_path", type=str, default="Qwen/Qwen2.5-1.5B",
+                   help="Path to model checkpoint or HF hub name")
+    p.add_argument("--benchmark", type=str, nargs="+",
+                   default=["gsm8k"],
+                   choices=["gsm8k", "mmlu"],
+                   help="Benchmarks to evaluate (default: gsm8k)")
+    p.add_argument("--gsm8k_max_samples", type=int, default=None,
+                   help="Limit GSM8K samples (default: all 1319)")
+    p.add_argument("--mmlu_max_per_subject", type=int, default=None,
+                   help="Limit MMLU samples per subject (default: all)")
+    p.add_argument("--mmlu_subjects", type=str, nargs="*", default=None,
+                   help="MMLU subjects to evaluate (default: all 57)")
+    p.add_argument("--mmlu_fewshot", type=int, default=5,
+                   help="Number of few-shot examples for MMLU (default: 5)")
+    p.add_argument("--max_new_tokens", type=int, default=256,
+                   help="Max tokens for GSM8K generation")
+    p.add_argument("--output_file", type=str, default="results.json",
+                   help="Save results as JSON to this path (default: results.json)")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    model, tokenizer = load_model_and_tokenizer(args.model_path)
+
+    results = {}
+
+    if "gsm8k" in args.benchmark:
+        print("\n" + "=" * 60)
+        print("GSM8K  (0-shot, official test set)")
+        print("=" * 60)
+        results["gsm8k_accuracy"] = evaluate_gsm8k(
+            model, tokenizer,
+            max_samples=args.gsm8k_max_samples,
+            max_new_tokens=args.max_new_tokens,
+        )
+
+    if "mmlu" in args.benchmark:
+        print("\n" + "=" * 60)
+        print(f"MMLU  ({args.mmlu_fewshot}-shot, {len(args.mmlu_subjects or MMLU_ALL_SUBJECTS)} subjects)")
+        print("=" * 60)
+        overall, per_subject = evaluate_mmlu(
+            model, tokenizer,
+            subjects=args.mmlu_subjects,
+            num_fewshot=args.mmlu_fewshot,
+            max_samples_per_subject=args.mmlu_max_per_subject,
+        )
+        results["mmlu_accuracy"] = overall
+        results["mmlu_per_subject"] = per_subject
+
+    print("\n" + "=" * 60)
+    print("Summary")
+    print("=" * 60)
+    for k, v in results.items():
+        if k == "mmlu_per_subject":
+            continue
+        print(f"  {k}: {v:.4f}")
+
+    # ── Save results ─────────────────────────────────────────────────
+    if args.output_file:
+        output = {
+            "model_path": args.model_path,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "benchmarks": args.benchmark,
+            "results": {},
+        }
+        if "gsm8k_accuracy" in results:
+            output["results"]["gsm8k"] = {
+                "accuracy": results["gsm8k_accuracy"],
+                "num_fewshot": 0,
+                "dataset": "gsm8k (test)",
+            }
+        if "mmlu_accuracy" in results:
+            output["results"]["mmlu"] = {
+                "accuracy": results["mmlu_accuracy"],
+                "num_fewshot": args.mmlu_fewshot,
+                "num_subjects": len(args.mmlu_subjects or MMLU_ALL_SUBJECTS),
+                "per_subject": results.get("mmlu_per_subject", {}),
+            }
+
+        os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
+        with open(args.output_file, "w") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+        print(f"\nResults saved to {args.output_file}")
+
+
+if __name__ == "__main__":
+    main()
