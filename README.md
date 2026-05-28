@@ -127,7 +127,7 @@ python plot_loss.py --logdir sft_qwen_gsm8k/logs --output loss.png --title "SFT 
 The script reads TensorBoard event files directly and supports any scalar tags
 (e.g., `train/loss`, `val/loss`, `train/mean_reward` from GRPO).
 
-## Logging
+### Logging
 
 TensorBoard logs are written to `--output_dir/logs`. Launch with:
 
@@ -137,32 +137,36 @@ tensorboard --logdir sft_qwen_gsm8k/logs
 
 ## Evaluation
 
+```bash
+cd eval
+```
+
 Evaluate a trained model on GSM8K (0-shot, official test set) and MMLU (5-shot).
 The evaluation script is standalone and works with any HF-compatible model path.
 `--model_path` defaults to `Qwen/Qwen2.5-1.5B` (the base model).
 
 ```bash
 # Base model, GSM8K only
-python ../val/evaluate.py
+python evaluate.py
 
 # Trained checkpoint, both benchmarks
-python ../eval/evaluate.py --model_path ./sft_qwen_gsm8k/final --benchmark gsm8k mmlu
+python evaluate.py --model_path ../sft/sft_qwen_gsm8k/final --benchmark gsm8k mmlu
 
 # Quick check (limited samples)
-python eval/evaluate.py --model_path ./sft_qwen_gsm8k/final \
+python evaluate.py --model_path ../sft/sft_qwen_gsm8k/final \
     --benchmark gsm8k mmlu --gsm8k_max_samples 100 --mmlu_max_per_subject 20
 
 # MMLU only, specific subjects, save results
-python eval/evaluate.py --model_path ./sft_qwen_gsm8k/final \
+python evaluate.py --model_path ../sft/sft_qwen_gsm8k/final \
     --benchmark mmlu --mmlu_subjects high_school_mathematics college_mathematics \
-    --output_file results.json
+    --output_file sft_mmlu_results.json
 ```
 
 ### Benchmarks
 
 | Benchmark | Few-shot | Dataset | Metric |
 |-----------|----------|---------|--------|
-| GSM8K | 0-shot | `gsm8k` test set (1,319 examples) | Exact match after `####` |
+| GSM8K | 0-shot | `openai/gsm8k` test set (1,319 examples) | Exact match after `####` |
 | MMLU | 5-shot | `cais/mmlu` test set (14,042 examples, 57 subjects) | Label logprob (matches lm_eval `acc`) |
 
 For GSM8K the script uses the official `gsm8k` test split (not the training val split)

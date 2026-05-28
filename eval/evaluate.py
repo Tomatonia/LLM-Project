@@ -19,6 +19,7 @@ Usage
 import argparse
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -60,6 +61,19 @@ MMLU_ALL_SUBJECTS = [
 ]
 
 
+def _extract_last_number(text: str) -> str:
+    """
+    Fallback: find the last numeric pattern in *text* when no '####' is present.
+
+    Matches integers, decimals, fractions, and comma-separated numbers.
+    Returns "" if nothing numeric is found.
+    """
+    # Match numbers like 42, 3.14, 1,200, 3/5, .5
+    pattern = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+|(?<!\d)\d+/\d+(?!\d)"
+    matches = re.findall(pattern, text)
+    return matches[-1] if matches else ""
+
+
 def _normalize_number(s: str) -> str:
     """Normalize a numeric answer string for comparison."""
     s = s.strip().lower()
@@ -83,20 +97,83 @@ def _normalize_number(s: str) -> str:
     return s
 
 
-def load_model_and_tokenizer(model_path: str):
-    """Load a model and tokenizer from a local path or HF hub."""
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+def _is_deepspeed_checkpoint(path: str) -> bool:
+    """Check whether *path* looks like a DeepSpeed (not HF) checkpoint."""
+    if not os.path.isdir(path):
+        return False
+    for f in os.listdir(path):
+        # DeepSpeed ZeRO optimizer state files: bf16_zero_pp_rank_*_optim_states.pt
+        if "zero_pp_rank" in f and f.endswith("_optim_states.pt"):
+            return True
+    return False
+
+
+def _load_model_from_deepspeed_ckpt(ckpt_path: str, base_model: str):
+    """Load a HuggingFace model from a DeepSpeed ZeRO checkpoint."""
+    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
+    # DeepSpeed saves the 'latest' pointer in the parent output_dir, not in the
+    # tag subdirectory.  Detect this: if ckpt_path/ has no 'latest' but its
+    # parent does (pointing to ckpt_path's basename), pass (parent, tag).
+    ckpt_dir = ckpt_path
+    tag = None
+    if not os.path.isfile(os.path.join(ckpt_path, "latest")):
+        parent = os.path.dirname(ckpt_path)
+        basename = os.path.basename(ckpt_path)
+        latest_file = os.path.join(parent, "latest")
+        if os.path.isfile(latest_file):
+            with open(latest_file) as f:
+                if f.read().strip() == basename:
+                    ckpt_dir = parent
+                    tag = basename
+
+    print(f"Converting DeepSpeed checkpoint from {ckpt_path} ...")
+    state_dict = get_fp32_state_dict_from_zero_checkpoint(ckpt_dir, tag=tag)
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_path,
+        base_model,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation="flash_attention_2",
         device_map="auto",
     )
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
+    print("  Done.")
+    return model
+
+
+def load_model_and_tokenizer(model_path: str, base_model: str = "Qwen/Qwen2.5-1.5B"):
+    """
+    Load model weights and tokenizer.
+
+    *model_path* may be an HF hub name, an HF-format checkpoint directory, or a
+    DeepSpeed checkpoint directory.  The tokenizer is loaded from *model_path*
+    if available, otherwise from *base_model*.
+    """
+    # ── Tokenizer ──────────────────────────────────────────────────────
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    except (OSError, ValueError):
+        print(f"Tokenizer not found in checkpoint, loading from {base_model}")
+        tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # ── Model ──────────────────────────────────────────────────────────
+    if _is_deepspeed_checkpoint(model_path):
+        model = _load_model_from_deepspeed_ckpt(model_path, base_model)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2",
+            device_map="auto",
+        )
+        model.eval()
+
     return model, tokenizer
 
 
@@ -104,34 +181,52 @@ def load_model_and_tokenizer(model_path: str):
 # GSM8K  (0-shot, official test set — 1319 examples)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def evaluate_gsm8k(model, tokenizer, max_samples=None, max_new_tokens=256):
+def evaluate_gsm8k(model, tokenizer, max_samples=None, max_new_tokens=256, batch_size=16):
     """
     Evaluate GSM8K accuracy using the official test split.
 
+    Processes prompts in batches for much faster generation throughput.
     Uses greedy decoding and extracts the answer after '####' from the
     generated solution. This matches the standard lm_eval GSM8K metric.
     """
-    dataset = load_dataset("gsm8k", "main", split="test")
+    dataset = load_dataset("openai/gsm8k", "main", split="test")
     if max_samples is not None:
         dataset = dataset.select(range(min(max_samples, len(dataset))))
 
-    correct, total = 0, 0
-    for example in tqdm(dataset, desc="GSM8K"):
+    # Pre-build all prompts and ground-truth answers
+    prompts = []
+    gt_answers = []
+    for example in dataset:
         question = example["question"]
-        # Extract ground-truth answer from the solution
         gt_solution = example["answer"]
-        if "####" in gt_solution:
-            gt_answer = gt_solution.split("####")[-1].strip()
-        else:
-            gt_answer = gt_solution.strip()
+        prompts.append(f"Problem: {question}\nSolution:\n")
+        gt_answers.append(
+            gt_solution.split("####")[-1].strip() if "####" in gt_solution
+            else gt_solution.strip()
+        )
 
-        prompt = f"Problem: {question}\nSolution:\n"
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=768)
-        device = next(model.parameters()).device
+    correct, total = 0, 0
+    no_hash_count = 0
+    debug_samples = []
+
+    # Left-padding is required for batched generation
+    original_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    device = next(model.parameters()).device
+
+    for i in tqdm(range(0, len(prompts), batch_size), desc="GSM8K"):
+        batch_prompts = prompts[i:i + batch_size]
+        batch_gt = gt_answers[i:i + batch_size]
+
+        inputs = tokenizer(
+            batch_prompts, return_tensors="pt", padding=True,
+            truncation=True, max_length=768,
+        )
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        input_len = inputs["input_ids"].size(1)   # padded length, same for all
 
         with torch.no_grad():
-            gen = model.generate(
+            gens = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
@@ -139,19 +234,36 @@ def evaluate_gsm8k(model, tokenizer, max_samples=None, max_new_tokens=256):
                 eos_token_id=tokenizer.eos_token_id,
                 use_cache=True,
             )
-        decoded = tokenizer.decode(gen[0], skip_special_tokens=True)
 
-        if "####" in decoded:
-            pred_answer = decoded.split("####")[-1].strip()
-        else:
-            pred_answer = ""
+        for j, (gen, gt) in enumerate(zip(gens, batch_gt)):
+            response_ids = gen[input_len:]                     # strip padding + prompt
+            decoded = tokenizer.decode(response_ids, skip_special_tokens=True)
 
-        if _normalize_number(pred_answer) == _normalize_number(gt_answer):
-            correct += 1
-        total += 1
+            if "####" in decoded:
+                pred_answer = decoded.split("####")[-1].strip()
+            else:
+                no_hash_count += 1
+                pred_answer = _extract_last_number(decoded)
+
+            if len(debug_samples) < 3:
+                debug_samples.append((len(response_ids),
+                                      decoded[-300:] if len(decoded) > 300 else decoded))
+
+            if _normalize_number(pred_answer) == _normalize_number(gt):
+                correct += 1
+            total += 1
+
+    tokenizer.padding_side = original_side
 
     acc = correct / total if total > 0 else 0.0
     print(f"GSM8K accuracy: {acc:.4f} ({correct}/{total})")
+    if no_hash_count > 0:
+        print(f"  ({no_hash_count}/{total} outputs missing '####' — used numeric fallback)")
+    if debug_samples:
+        print(f"  First {len(debug_samples)} outputs (gen_len, tail):")
+        for gen_len, tail in debug_samples:
+            print(f"    [{gen_len} tokens] ...{tail[-200:]}")
+
     return acc
 
 
@@ -166,24 +278,27 @@ def _format_mmlu_question(question: str, choices: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _mmulu_choice_token_ids(tokenizer, prompt: str) -> list[int]:
+def _mmulu_choice_token_ids(tokenizer) -> list[list[int]]:
     """
-    Return the token IDs that represent A/B/C/D as continuations of *prompt*.
+    Return candidate token IDs for each choice letter (A/B/C/D).
 
-    Encodes ``prompt + letter`` for each letter and takes the single new token
-    that follows the prompt tokens.  Works correctly regardless of whether the
-    tokenizer uses ``"A"`` or ``" A"`` (space-prefixed) after a newline.
+    Tries both ``"A"`` and ``" A"`` (space-prefixed) since BPE tokenizers
+    differ in how they encode a letter immediately after a newline.
+    Returns a list of lists: ``[[a_opts], [b_opts], [c_opts], [d_opts]]``.
+    During scoring we take the max logprob across each letter's options.
     """
-    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     ids = []
     for letter in CHOICE_LETTERS:
-        full_ids = tokenizer.encode(prompt + letter, add_special_tokens=False)
-        diff = full_ids[len(prompt_ids):]
-        if len(diff) != 1:
+        options = []
+        for prefix in ("", " "):
+            tid = tokenizer.encode(prefix + letter, add_special_tokens=False)
+            if len(tid) == 1:
+                options.append(tid[0])
+        if not options:
             raise RuntimeError(
-                f"Expected 1 token for '{letter}' continuation, got {len(diff)}: {diff}"
+                f"Cannot find single-token encoding for '{letter}'"
             )
-        ids.append(diff[0])
+        ids.append(options)
     return ids
 
 
@@ -208,6 +323,9 @@ def evaluate_mmlu(
 
     dev_set = load_dataset("cais/mmlu", "all", split="dev")
     test_set = load_dataset("cais/mmlu", "all", split="test")
+
+    # Pre-compute choice token IDs (depends only on the tokenizer)
+    choice_token_ids = _mmulu_choice_token_ids(tokenizer)
 
     all_correct, all_total = 0, 0
     subject_accuracies = {}
@@ -242,11 +360,6 @@ def evaluate_mmlu(
 
             prompt = "\n".join(parts)
 
-            # Get token IDs for A/B/C/D as the next token after the prompt
-            # (strip trailing "Answer:" to find the continuation token)
-            answer_prefix = "\n".join(parts[:-1]) + "\nAnswer:"
-            choice_token_ids = _mmulu_choice_token_ids(tokenizer, answer_prefix)
-
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
             device = next(model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -254,10 +367,12 @@ def evaluate_mmlu(
             with torch.no_grad():
                 outputs = model(**inputs)
                 next_logits = outputs.logits[0, -1, :].float()
+                next_logprobs = F.log_softmax(next_logits, dim=-1)
 
+            # Score each choice by max logprob across its candidate token IDs
             choice_logprobs = [
-                F.log_softmax(next_logits, dim=-1)[tid].item()
-                for tid in choice_token_ids
+                max(next_logprobs[tid].item() for tid in token_options)
+                for token_options in choice_token_ids
             ]
             pred_idx = int(torch.argmax(torch.tensor(choice_logprobs)).item())
 
@@ -283,13 +398,17 @@ def evaluate_mmlu(
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate a model on GSM8K and MMLU")
     p.add_argument("--model_path", type=str, default="Qwen/Qwen2.5-1.5B",
-                   help="Path to model checkpoint or HF hub name")
+                   help="Model checkpoint path, DeepSpeed ckpt dir, or HF hub name")
+    p.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-1.5B",
+                   help="Base model for architecture and tokenizer (used when --model_path is a DeepSpeed ckpt)")
     p.add_argument("--benchmark", type=str, nargs="+",
                    default=["gsm8k"],
                    choices=["gsm8k", "mmlu"],
                    help="Benchmarks to evaluate (default: gsm8k)")
     p.add_argument("--gsm8k_max_samples", type=int, default=None,
                    help="Limit GSM8K samples (default: all 1319)")
+    p.add_argument("--gsm8k_batch_size", type=int, default=16,
+                   help="Batch size for GSM8K generation (default: 16)")
     p.add_argument("--mmlu_max_per_subject", type=int, default=None,
                    help="Limit MMLU samples per subject (default: all)")
     p.add_argument("--mmlu_subjects", type=str, nargs="*", default=None,
@@ -305,7 +424,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    model, tokenizer = load_model_and_tokenizer(args.model_path)
+    model, tokenizer = load_model_and_tokenizer(args.model_path, args.base_model)
 
     results = {}
 
@@ -317,6 +436,7 @@ def main():
             model, tokenizer,
             max_samples=args.gsm8k_max_samples,
             max_new_tokens=args.max_new_tokens,
+            batch_size=args.gsm8k_batch_size,
         )
 
     if "mmlu" in args.benchmark:
@@ -352,7 +472,7 @@ def main():
             output["results"]["gsm8k"] = {
                 "accuracy": results["gsm8k_accuracy"],
                 "num_fewshot": 0,
-                "dataset": "gsm8k (test)",
+                "dataset": "openai/gsm8k (test)",
             }
         if "mmlu_accuracy" in results:
             output["results"]["mmlu"] = {
