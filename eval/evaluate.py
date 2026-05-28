@@ -61,14 +61,22 @@ MMLU_ALL_SUBJECTS = [
 ]
 
 
+def _extract_boxed(text: str) -> str | None:
+    """Extract the content of the last ``\\boxed{...}`` in *text*, or None."""
+    # Match \boxed{...} allowing for nested braces (simple single-level)
+    matches = re.findall(r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", text)
+    return matches[-1].strip() if matches else None
+
+
 def _extract_last_number(text: str) -> str:
     """
-    Fallback: find the last numeric pattern in *text* when no '####' is present.
+    Fallback: find the last numeric pattern in *text* when no structured
+    answer marker is present.
 
     Matches integers, decimals, fractions, and comma-separated numbers.
     Returns "" if nothing numeric is found.
     """
-    # Match numbers like 42, 3.14, 1,200, 3/5, .5
+    # Match numbers like 42, 3.14, 1,200, 3/5, .5, -10
     pattern = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+|(?<!\d)\d+/\d+(?!\d)"
     matches = re.findall(pattern, text)
     return matches[-1] if matches else ""
@@ -77,7 +85,7 @@ def _extract_last_number(text: str) -> str:
 def _normalize_number(s: str) -> str:
     """Normalize a numeric answer string for comparison."""
     s = s.strip().lower()
-    s = s.replace("$", "").replace(",", "").replace("%", "").replace(" ", "")
+    s = s.replace("\\", "").replace("$", "").replace(",", "").replace("%", "").replace(" ", "")
 
     if "/" in s and s.count("/") == 1:
         try:
@@ -206,7 +214,7 @@ def evaluate_gsm8k(model, tokenizer, max_samples=None, max_new_tokens=256, batch
         )
 
     correct, total = 0, 0
-    no_hash_count = 0
+    no_marker_count = 0
     debug_samples = []
 
     # Left-padding is required for batched generation
@@ -239,10 +247,13 @@ def evaluate_gsm8k(model, tokenizer, max_samples=None, max_new_tokens=256, batch
             response_ids = gen[input_len:]                     # strip padding + prompt
             decoded = tokenizer.decode(response_ids, skip_special_tokens=True)
 
+            # Extract answer: try #### first, then \boxed{}, then numeric fallback
             if "####" in decoded:
                 pred_answer = decoded.split("####")[-1].strip()
+            elif (boxed := _extract_boxed(decoded)) is not None:
+                pred_answer = boxed
             else:
-                no_hash_count += 1
+                no_marker_count += 1
                 pred_answer = _extract_last_number(decoded)
 
             if len(debug_samples) < 3:
@@ -257,8 +268,8 @@ def evaluate_gsm8k(model, tokenizer, max_samples=None, max_new_tokens=256, batch
 
     acc = correct / total if total > 0 else 0.0
     print(f"GSM8K accuracy: {acc:.4f} ({correct}/{total})")
-    if no_hash_count > 0:
-        print(f"  ({no_hash_count}/{total} outputs missing '####' — used numeric fallback)")
+    if no_marker_count > 0:
+        print(f"  ({no_marker_count}/{total} outputs missing '####' and '\\boxed{{}}' — used numeric fallback)")
     if debug_samples:
         print(f"  First {len(debug_samples)} outputs (gen_len, tail):")
         for gen_len, tail in debug_samples:
@@ -366,7 +377,7 @@ def evaluate_mmlu(
 
             with torch.no_grad():
                 outputs = model(**inputs)
-                next_logits = outputs.logits[0, -1, :].float()
+                next_logits = outputs.logits[0, -1, :].float() # one pass only (prefill)
                 next_logprobs = F.log_softmax(next_logits, dim=-1)
 
             # Score each choice by max logprob across its candidate token IDs
@@ -407,15 +418,15 @@ def parse_args():
                    help="Benchmarks to evaluate (default: gsm8k)")
     p.add_argument("--gsm8k_max_samples", type=int, default=None,
                    help="Limit GSM8K samples (default: all 1319)")
-    p.add_argument("--gsm8k_batch_size", type=int, default=16,
-                   help="Batch size for GSM8K generation (default: 16)")
+    p.add_argument("--gsm8k_batch_size", type=int, default=32,
+                   help="Batch size for GSM8K generation (default: 32)")
     p.add_argument("--mmlu_max_per_subject", type=int, default=None,
                    help="Limit MMLU samples per subject (default: all)")
     p.add_argument("--mmlu_subjects", type=str, nargs="*", default=None,
                    help="MMLU subjects to evaluate (default: all 57)")
     p.add_argument("--mmlu_fewshot", type=int, default=5,
                    help="Number of few-shot examples for MMLU (default: 5)")
-    p.add_argument("--max_new_tokens", type=int, default=256,
+    p.add_argument("--max_new_tokens", type=int, default=512,
                    help="Max tokens for GSM8K generation")
     p.add_argument("--output_file", type=str, default="results.json",
                    help="Save results as JSON to this path (default: results.json)")
