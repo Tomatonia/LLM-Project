@@ -3,9 +3,9 @@ Extract train/val loss curves from TensorBoard logs and save as a PNG.
 
 Usage
 -----
-    python sft/plot_loss.py --logdir ./sft_qwen_gsm8k/logs
-    python sft/plot_loss.py --logdir ./sft_qwen_gsm8k/logs --smooth 0.6  # more smoothing
-    python sft/plot_loss.py --logdir ./grpo_qwen_gsm8k/logs --tag train/mean_reward --ylabel "Mean Reward"
+    python plot_loss.py --logdir ./sft_qwen_gsm8k/logs
+    python plot_loss.py --logdir ./sft_qwen_gsm8k/logs --smooth 0.6  # more smoothing
+    python plot_loss.py --logdir ./grpo_qwen_gsm8k/logs --tag train/mean_reward --ylabel "Mean Reward"
 """
 
 import argparse
