@@ -13,8 +13,8 @@ sft/
 grpo/
 ├── train_grpo.py         # GRPO training script
 ├── rewards.py            # GSM8K reward functions
-├── ds_config_grpo.json   # DeepSpeed configuration
-└── ARCHITECTURE.md       # GRPO pipeline documentation
+├── ds_config_grpo.json   # DeepSpeed ZeRO-2 configuration
+└── plot_metrics.py       # Plot reward and accuracy curves
 
 eval/
 └── evaluate.py           # GSM8K + MMLU evaluation (standalone)
@@ -39,14 +39,7 @@ wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.2/flash
 pip install flash_attn-2.8.2+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 ```
 
-**Note:** The training scripts set `HF_ENDPOINT=https://hf-mirror.com` for downloading models
-and datasets behind the GFW. Remove or change this if you are outside mainland China.
-
 ## SFT Training
-
-```bash
-cd sft
-```
 
 Supervised fine-tunes `Qwen/Qwen2.5-1.5B` on GSM8K math problems from the
 [NuminaMath-CoT](https://huggingface.co/datasets/AI-MO/NuminaMath-CoT) dataset.
@@ -56,7 +49,7 @@ and the default settings below, one epoch is ~1,653 iterations and one training 
 (2 epochs) is ~3,306 iterations (~1,653 optimizer steps after gradient accumulation).
 
 ```bash
-deepspeed --num_gpus=2 sft/train_sft.py --deepspeed_config ds_config.json
+deepspeed --num_gpus=2 sft/train_sft.py --deepspeed_config sft/ds_config.json
 ```
 
 ### Key arguments
@@ -71,7 +64,7 @@ deepspeed --num_gpus=2 sft/train_sft.py --deepspeed_config ds_config.json
 | `--per_device_eval_batch_size` | `2` | Eval batch size per GPU |
 | `--gradient_accumulation_steps` | `2` | Accumulate before each optimizer step |
 | `--max_length` | `1024` | Max tokenized sequence length |
-| `--output_dir` | `./sft_qwen_gsm8k` | Checkpoint and log directory |
+| `--output_dir` | `sft/sft_qwen_gsm8k` | Checkpoint and log directory |
 | `--logging_steps` | `10` | Log train loss every N iterations |
 | `--eval_steps` | `100` | Run validation every N iterations |
 | `--save_steps` | `1000` | Save checkpoint every N iterations |
@@ -104,7 +97,7 @@ gradient accumulation boundaries so LR decay is correctly aligned with optimizer
 ### Resuming from a checkpoint
 
 ```bash
-deepspeed --num_gpus=2 sft/train_sft.py --resume_from_checkpoint ./sft_qwen_gsm8k/step_1000 --deepspeed_config ds_config.json
+deepspeed --num_gpus=2 sft/train_sft.py --resume_from_checkpoint sft/sft_qwen_gsm8k/step_1000 --deepspeed_config ds_config.json
 ```
 
 The resume path can point to a step directory (`step_1000`), an epoch directory
@@ -115,31 +108,114 @@ state, and LR scheduler state from the checkpoint.
 
 ```bash
 # Raw curves
-python plot_loss.py --logdir sft_qwen_gsm8k/logs
+python sft/plot_loss.py --logdir sft/sft_qwen_gsm8k/logs
 
 # With EMA smoothing
-python plot_loss.py --logdir sft_qwen_gsm8k/logs --smooth 0.6
+python sft/plot_loss.py --logdir sft/sft_qwen_gsm8k/logs --smooth 0.6
 
 # Custom output
-python plot_loss.py --logdir sft_qwen_gsm8k/logs --output loss.png --title "SFT on GSM8K"
+python sft/plot_loss.py --logdir sft/sft_qwen_gsm8k/logs --output loss.png --title "SFT on GSM8K"
 ```
 
 The script reads TensorBoard event files directly and supports any scalar tags
 (e.g., `train/loss`, `val/loss`, `train/mean_reward` from GRPO).
 
-### Logging
+## Logging
 
 TensorBoard logs are written to `--output_dir/logs`. Launch with:
 
 ```bash
-tensorboard --logdir sft_qwen_gsm8k/logs
+tensorboard --logdir sft/sft_qwen_gsm8k/logs
+tensorboard --logdir grpo/grpo_qwen_gsm8k/logs
+```
+
+## GRPO Training
+
+Group Relative Policy Optimization (GRPO) is a reinforcement learning stage that runs
+after SFT (or from the base model) to further improve mathematical reasoning. Unlike PPO,
+GRPO eliminates the critic network by normalising rewards *within a group* of G responses
+to the same prompt. The policy is updated with a clipped surrogate objective plus a KL
+penalty against a frozen reference model.
+
+GRPO trains from the base model by default (`Qwen/Qwen2.5-1.5B`). To train on top of an
+SFT checkpoint, pass `--model_path sft/sft_qwen_gsm8k/final`.
+
+The training uses all 7,345 GSM8K prompts from NuminaMath-CoT (no train/val split needed
+since the model generates its own rollouts — no ground-truth leakage). With 2 GPUs and the
+default settings, one epoch is ~919 iterations.
+
+```bash
+deepspeed --num_gpus=2 grpo/train_grpo.py --deepspeed_config grpo/ds_config_grpo.json
+```
+
+### Key arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model_path` | `Qwen/Qwen2.5-1.5B` | Starting checkpoint (base model or SFT) |
+| `--group_size` | `4` | G: responses sampled per prompt |
+| `--kl_coef` | `0.04` | Weight of KL penalty against reference model |
+| `--clip_epsilon` | `0.2` | PPO clipping threshold |
+| `--num_epochs` | `2` | Number of training epochs |
+| `--learning_rate` | `1e-6` | Peak learning rate (lower than SFT for stable RL) |
+| `--warmup_steps` | `20` | LR warmup steps |
+| `--per_device_prompt_batch_size` | `4` | Prompts per GPU per step |
+| `--max_new_tokens` | `256` | Max tokens for rollout generation |
+| `--temperature` | `1.0` | Sampling temperature for rollouts |
+| `--top_p` | `0.9` | Nucleus sampling threshold |
+| `--output_dir` | `grpo/grpo_qwen_gsm8k` | Checkpoint and log directory |
+| `--logging_steps` | `5` | Log train metrics every N iterations |
+| `--eval_steps` | `100` | Run evaluation on official GSM8K test set |
+| `--save_steps` | `500` | Save checkpoint every N iterations |
+
+### How it works
+
+Each training step:
+
+1. **Generate rollouts** — B prompts × G=4 responses each = B×G candidate solutions
+   generated in a single batched call (sampling with temperature 1.0).
+2. **Compute rewards** — extract answer from `####` or `\boxed{}`, compare to
+   ground truth (binary 0/1).
+3. **Group-relative advantages** — A_i = (r_i − mean) / (std + ε) normalised per prompt.
+4. **Forward passes** — compute token-level logprobs for old policy (no grad),
+   reference model (no grad), and new policy (with grad).
+5. **GRPO loss** — clipped surrogate + KL penalty, applied to response tokens only.
+6. **Backward + step** via DeepSpeed ZeRO-2.
+
+### Evaluation during training
+
+Every `--eval_steps` iterations, the script evaluates accuracy on the official
+`openai/gsm8k` test set (1,319 examples) using batched greedy decoding. This is
+the same metric used for final evaluation.
+
+### Reward function
+
+The reward is binary: 1.0 if the final answer matches the ground truth after
+normalisation (number parsing, fraction handling, trailing zero stripping), 0.0
+otherwise. Both `####` (GSM8K convention) and `\boxed{}` (LaTeX convention) are
+recognised as answer markers.
+
+### DeepSpeed configuration (`ds_config_grpo.json`)
+
+ZeRO Stage 2 with BF16 and no CPU offload (same rationale as SFT). The scheduler is
+handled in code to avoid double-scheduler conflicts. Gradient checkpointing is enabled
+on the policy model; rollout generation temporarily switches to eval mode for fast
+KV-cache inference.
+
+### Visualizing metrics
+
+```bash
+# Reward + accuracy (default)
+python grpo/plot_metrics.py
+
+# With specific tags
+python grpo/plot_metrics.py --tags train/mean_reward eval/gsm8k_accuracy train/loss train/kl
+
+# No smoothing
+python grpo/plot_metrics.py --smooth 0
 ```
 
 ## Evaluation
-
-```bash
-cd eval
-```
 
 Evaluate a trained model on GSM8K (0-shot, official test set) and MMLU (5-shot).
 The evaluation script is standalone and works with any HF-compatible model path.
@@ -147,19 +223,19 @@ The evaluation script is standalone and works with any HF-compatible model path.
 
 ```bash
 # Base model, GSM8K only
-python evaluate.py
+python eval/evaluate.py
 
 # Trained checkpoint, both benchmarks
-python evaluate.py --model_path ../sft/sft_qwen_gsm8k/final --benchmark gsm8k mmlu
+python eval/evaluate.py --model_path sft/sft_qwen_gsm8k/final --benchmark gsm8k mmlu
 
 # Quick check (limited samples)
-python evaluate.py --model_path ../sft/sft_qwen_gsm8k/final \
+python eval/evaluate.py --model_path sft/sft_qwen_gsm8k/final \
     --benchmark gsm8k mmlu --gsm8k_max_samples 100 --mmlu_max_per_subject 20
 
 # MMLU only, specific subjects, save results
-python evaluate.py --model_path ../sft/sft_qwen_gsm8k/final \
+python eval/evaluate.py --model_path sft/sft_qwen_gsm8k/final \
     --benchmark mmlu --mmlu_subjects high_school_mathematics college_mathematics \
-    --output_file sft_mmlu_results.json
+    --output_file eval/sft_mmlu_results.json
 ```
 
 ### Benchmarks

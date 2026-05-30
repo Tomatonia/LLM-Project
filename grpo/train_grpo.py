@@ -30,12 +30,8 @@ Pipeline per training step
 
 Usage
 -----
-    deepspeed --num_gpus=2 grpo/train_grpo.py \
-        --model_path ./sft_qwen_gsm8k \
-        --output_dir ./grpo_qwen_gsm8k \
-        --num_epochs 2 \
-        --group_size 4 \
-        --kl_coef 0.04
+    deepspeed --num_gpus=2 train_grpo.py \
+        --deepspeed_config ds_config_grpo.json
 """
 
 import argparse
@@ -451,7 +447,7 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=20)
 
     # Logging & saving
-    p.add_argument("--output_dir", type=str, default="./grpo_qwen_gsm8k")
+    p.add_argument("--output_dir", type=str, default="grpo/grpo_qwen_gsm8k")
     p.add_argument("--logging_steps", type=int, default=5)
     p.add_argument("--eval_steps", type=int, default=100)
     p.add_argument("--save_steps", type=int, default=500)

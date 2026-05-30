@@ -113,7 +113,7 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=100)
-    parser.add_argument("--output_dir", type=str, default="./sft_qwen_gsm8k")
+    parser.add_argument("--output_dir", type=str, default="sft/sft_qwen_gsm8k")
     parser.add_argument("--save_steps", type=int, default=1000)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to a DeepSpeed checkpoint directory to resume from")
