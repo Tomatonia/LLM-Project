@@ -6,13 +6,13 @@ Aligns with lm_eval methodology where applicable.
 Usage
 -----
     # GSM8K (0-shot, official test set)
-    python eval/evaluate.py --model_path ./sft_qwen_gsm8k/final --benchmark gsm8k
+    python eval/evaluate.py --model_path sft/sft_qwen_gsm8k/final --benchmark gsm8k
 
     # MMLU (5-shot, 57 subjects)
-    python eval/evaluate.py --model_path ./sft_qwen_gsm8k/final --benchmark mmlu
+    python eval/evaluate.py --model_path sft/sft_qwen_gsm8k/final --benchmark mmlu
 
     # Both benchmarks, limit samples for quick check
-    python eval/evaluate.py --model_path ./sft_qwen_gsm8k/final --benchmark gsm8k mmlu \
+    python eval/evaluate.py --model_path sft/sft_qwen_gsm8k/final --benchmark gsm8k mmlu \
         --gsm8k_max_samples 100 --mmlu_max_per_subject 20
 """
 

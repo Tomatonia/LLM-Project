@@ -12,7 +12,6 @@ sft/
 
 grpo/
 ├── train_grpo.py         # GRPO training script
-├── rewards.py            # GSM8K reward functions
 ├── ds_config_grpo.json   # DeepSpeed ZeRO-2 configuration
 └── plot_metrics.py       # Plot reward and accuracy curves
 
