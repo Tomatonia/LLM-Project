@@ -30,8 +30,9 @@ Pipeline per training step
 
 Usage
 -----
-    deepspeed --num_gpus=2 train_grpo.py \
-        --deepspeed_config ds_config_grpo.json
+    deepspeed --num_gpus=2 grpo/train_grpo.py \
+        --deepspeed_config grpo/ds_config_grpo.json \
+        --num_epochs 1
 """
 
 import argparse
@@ -228,23 +229,24 @@ def grpo_loss(
     surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * adv
     policy_loss = -torch.min(surr1, surr2)
 
-    # KL penalty  (log π_θ - log π_ref), clamped to ≥ 0 per token
-    # Negative values are estimation noise: tokens were sampled from π_old,
-    # not π_θ, so new_logprobs can legitimately be < ref_logprobs per token.
-    kl_per_token = torch.clamp(new_logprobs - ref_logprobs, min=0.0)
-
     mask = response_mask.float()
     n_tokens = mask.sum().clamp(min=1)
 
-    loss = ((policy_loss * mask).sum() + kl_coef * (kl_per_token * mask).sum()) / n_tokens
+    # KL penalty  (log π_θ - log π_ref)
+    # Negative values are estimation noise: tokens were sampled from π_old,
+    # not π_θ, so new_logprobs can legitimately be < ref_logprobs per token.
+    # Estimate of KL per token to reduce variance: pi_ref/pi_theta + log(pi_theta) - log(pi_ref) - 1
+    kl_per_token = new_logprobs - ref_logprobs
+    kl_per_token += torch.exp(-kl_per_token) - 1
+
+    loss = ((policy_loss * mask).sum() + kl_coef * torch.clamp((kl_per_token * mask).sum(), min=0.0)) / n_tokens
 
     with torch.no_grad():
         clipped_frac = ((ratio < 1.0 - clip_epsilon) | (ratio > 1.0 + clip_epsilon)).float()
         # Report the unclamped estimate for monitoring
-        raw_kl = (new_logprobs - ref_logprobs) * mask
         stats = {
             "policy_loss": (policy_loss * mask).sum() / n_tokens,
-            "kl_divergence": raw_kl.sum() / n_tokens,
+            "kl_divergence": kl_per_token.sum() / n_tokens,
             "clipped_fraction": (clipped_frac * mask).sum() / n_tokens,
         }
     return loss, stats
@@ -436,7 +438,7 @@ def parse_args():
     p.add_argument("--group_size", type=int, default=4,
                    help="G: responses sampled per prompt")
     p.add_argument("--clip_epsilon", type=float, default=0.2)
-    p.add_argument("--kl_coef", type=float, default=0.04)
+    p.add_argument("--kl_coef", type=float, default=0.08)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_p", type=float, default=0.9)
 
