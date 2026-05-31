@@ -453,6 +453,8 @@ def parse_args():
     p.add_argument("--logging_steps", type=int, default=5)
     p.add_argument("--eval_steps", type=int, default=100)
     p.add_argument("--save_steps", type=int, default=500)
+    p.add_argument("--resume_from_checkpoint", type=str, default=None,
+                   help="Path to a DeepSpeed checkpoint directory to resume from")
 
     p = deepspeed.add_config_arguments(p)
     return p.parse_args()
@@ -526,14 +528,49 @@ def train():
     # ── TensorBoard ─────────────────────────────────────────────────
     writer = SummaryWriter(os.path.join(args.output_dir, "logs")) if rank == 0 else None
 
+    # ── Resume from checkpoint ──────────────────────────────────────
+    resume_step = 0
+    start_epoch = 0
+    if args.resume_from_checkpoint:
+        ckpt_path = args.resume_from_checkpoint.rstrip("/")
+        parent, last = os.path.split(ckpt_path)
+        if last.startswith("step_") or last in ("final", "latest"):
+            load_dir, tag = parent, last
+        elif last.startswith("epoch_"):
+            load_dir, tag = parent, last
+        else:
+            load_dir, tag = ckpt_path, None
+
+        if rank == 0:
+            print(f"Loading checkpoint: load_dir={load_dir}, tag={tag or '(latest)'}")
+
+        _, client_state = model_engine.load_checkpoint(load_dir, tag=tag)
+        if client_state is None:
+            raise RuntimeError(
+                f"Failed to load checkpoint from {ckpt_path}. "
+                f"Check that the checkpoint directory exists and contains valid checkpoint files."
+            )
+        resume_step = client_state.get("global_step", 0)
+        start_epoch = resume_step // len(train_loader)
+        # Fast-forward LR scheduler to the resumed step
+        if scheduler is not None:
+            scheduler.last_epoch = resume_step
+        if rank == 0:
+            print(f"Resumed from checkpoint at step {resume_step}, epoch {start_epoch + 1}")
+
     # ── Training ────────────────────────────────────────────────────
     global_step = 0
     ds_device = model_engine.device
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         train_sampler.set_epoch(epoch)
 
         for batch in train_loader:
+            # Skip batches already covered by the resumed checkpoint
+            if global_step < resume_step and epoch == start_epoch:
+                global_step += 1
+                continue
+
             prompt_ids = batch["input_ids"].to(ds_device)
             prompt_mask = batch["attention_mask"].to(ds_device)
             answers = batch["answers"]
