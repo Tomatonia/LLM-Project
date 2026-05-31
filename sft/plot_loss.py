@@ -58,18 +58,21 @@ def plot_losses(
     linestyles = {"train": "-", "val": "--", "eval": "--"}
 
     for tag, (steps, values) in data.items():
-        # Infer label from tag (e.g. "train/loss" → "train")
         label = tag.split("/")[-1]
         series = tag.split("/")[0]
+        is_eval = series in ("val", "eval")
 
         color = colors.get(series, None)
         ls = linestyles.get(series, "-")
 
-        y = np.array(values)
-        if smooth > 0:
+        # Don't smooth eval metrics — sparse data (every ~100 steps), EMA distorts
+        if smooth > 0 and not is_eval:
             y = exponential_smooth(values, smooth)
+        else:
+            y = np.array(values)
 
-        ax.plot(steps, y, label=f"{series} {label}", color=color, linestyle=ls, linewidth=1.2, alpha=0.9)
+        ax.plot(steps, y, label=f"{series} {label}", color=color, linestyle=ls,
+                linewidth=1.2, alpha=0.9, marker="o" if is_eval else "")
 
     ax.set_xlabel("Step")
     ax.set_ylabel(ylabel)

@@ -63,10 +63,16 @@ def plot_metrics(
     }
 
     for tag, (steps, values) in data.items():
-        y = exponential_smooth(values, smooth) if smooth > 0 else np.array(values)
+        # Don't smooth eval metrics — they only log every ~100 steps and
+        # EMA would badly distort sparse, step-like data.
+        is_eval = tag.startswith("eval/")
+        if smooth > 0 and not is_eval:
+            y = exponential_smooth(values, smooth)
+        else:
+            y = np.array(values)
         label = labels.get(tag, tag)
         ax1.plot(steps, y, label=label, color=colors.get(tag),
-                 linewidth=1.2, alpha=0.9)
+                 linewidth=1.2, alpha=0.9, marker="o" if is_eval else "")
 
     ax1.set_xlabel("Step")
     ax1.legend(loc="upper left")
