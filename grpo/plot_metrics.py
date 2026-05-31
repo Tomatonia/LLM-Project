@@ -25,7 +25,12 @@ def load_scalars(logdir: str, tags: list[str]) -> dict[str, tuple[list[int], lis
             print(f"Warning: tag '{tag}' not found in {logdir}")
             continue
         events = acc.Scalars(tag)
-        result[tag] = ([e.step for e in events], [e.value for e in events])
+        # Deduplicate by step — resume can write overlapping steps; keep last
+        seen: dict[int, float] = {}
+        for e in events:
+            seen[e.step] = e.value
+        steps = sorted(seen.keys())
+        result[tag] = (steps, [seen[s] for s in steps])
     return result
 
 
@@ -89,7 +94,7 @@ def plot_metrics(
 
 def parse_args():
     p = argparse.ArgumentParser(description="Plot GRPO training metrics")
-    p.add_argument("--logdir", type=str, default="./grpo_qwen_gsm8k/logs")
+    p.add_argument("--logdir", type=str, default="grpo/grpo_qwen_gsm8k/logs")
     p.add_argument("--output", type=str, default=None)
     p.add_argument("--smooth", type=float, default=0.6)
     p.add_argument("--tags", type=str, nargs="+",

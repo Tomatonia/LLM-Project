@@ -27,9 +27,12 @@ def load_scalars(logdir: str, tags: list[str]) -> dict[str, tuple[list[int], lis
             print(f"Warning: tag '{tag}' not found in {logdir}")
             continue
         events = acc.Scalars(tag)
-        steps = [e.step for e in events]
-        values = [e.value for e in events]
-        result[tag] = (steps, values)
+        # Deduplicate by step — resume can write overlapping steps; keep last
+        seen: dict[int, float] = {}
+        for e in events:
+            seen[e.step] = e.value
+        steps = sorted(seen.keys())
+        result[tag] = (steps, [seen[s] for s in steps])
     return result
 
 
