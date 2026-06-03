@@ -15,6 +15,16 @@ grpo/
 ├── ds_config_grpo.json   # DeepSpeed ZeRO-2 configuration
 └── plot_metrics.py       # Plot reward and accuracy curves
 
+moe/
+├── expert.py             # Expert FFN (Qwen2MLP architecture)
+├── router.py             # TopKRouter with temperature-scaled softmax
+├── moe_layer.py          # MoEBlockWithShared / MoEBlock / convert_to_moe
+├── convert_dense.py      # Prepare dense model + moe_config.json
+├── train_moe.py          # GRPO + MoE training script
+├── eval_moe.py           # GSM8K + MMLU evaluation for MoE checkpoints
+├── diagnostic.py         # Init correctness check (compare vs dense)
+└── ds_config_moe.json    # ZeRO-2, BF16, grad_accum=1
+
 eval/
 └── evaluate.py           # GSM8K + MMLU evaluation (standalone)
 ```
@@ -119,15 +129,6 @@ python sft/plot_loss.py --logdir sft/sft_qwen_gsm8k/logs --output loss.png --tit
 The script reads TensorBoard event files directly and supports any scalar tags
 (e.g., `train/loss`, `val/loss`, `train/mean_reward` from GRPO).
 
-## Logging
-
-TensorBoard logs are written to `--output_dir/logs`. Launch with:
-
-```bash
-tensorboard --logdir sft/sft_qwen_gsm8k/logs
-tensorboard --logdir grpo/grpo_qwen_gsm8k/logs
-```
-
 ## GRPO Training
 
 Group Relative Policy Optimization (GRPO) is a reinforcement learning stage that runs
@@ -214,6 +215,81 @@ python grpo/plot_metrics.py --tags train/mean_reward eval/gsm8k_accuracy train/l
 python grpo/plot_metrics.py --smooth 0
 ```
 
+## MoE Training
+
+Mixture-of-Experts GRPO training replaces half the dense FFN layers in
+`Qwen/Qwen2.5-1.5B` with shared+routed MoE blocks (1 shared expert + 3 routed,
+top-2 gating).  Custom dispatch/combine with partitioned weight initialization
+for proper ZeRO-2 integration.
+
+```bash
+# 1. Convert the dense model (saves dense weights + moe_config.json)
+python -m moe.convert_dense \
+    --model_path Qwen/Qwen2.5-1.5B \
+    --output moe/qwen_moe_init
+
+# 2. Train MoE with GRPO
+deepspeed --num_gpus=2 moe/train_moe.py \
+    --model_path moe/qwen_moe_init \
+    --output_dir moe/moe_qwen_gsm8k \
+    --deepspeed_config moe/ds_config_moe.json
+
+# 3. Evaluate
+python moe/eval_moe.py \
+    --model_path moe/moe_qwen_gsm8k/final \
+    --base_model moe/qwen_moe_init \
+    --benchmark gsm8k mmlu
+```
+
+### Architecture
+
+14 of 28 transformer layers (every other, starting from layer 1) have their
+`Qwen2MLP` replaced with an `MoEBlockWithShared`: one shared expert (4096 dims,
+always active) + 3 routed experts (3072 dims each, top-2 gating).  The shared
+expert covers dense-FFN dims [0, 4096) at full strength on every token; the 3
+routed experts partition the remaining dims with staggered overlapping slices.
+
+Total: ~1.83B params, fits 2×24 GB GPUs under ZeRO-2 (~21 GB peak at batch
+size 4).  For lower memory, reduce `--per_device_prompt_batch_size`.
+
+### DeepSpeed configuration
+
+ZeRO Stage 2, BF16, no CPU offload, `gradient_accumulation_steps: 1`.
+ZeRO-2 keeps full params per GPU — no `GatheredParameters` or weight
+syncing needed.  Generation, forward passes, and backward all work directly.
+
+### Key arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model_path` | `moe/qwen_moe_init` | Converted model directory |
+| `--per_device_prompt_batch_size` | `4` | Prompts per GPU per step |
+| `--temperature` | `1.0` | Rollout sampling temperature |
+| `--eval_batch_size` | `16` | GSM8K eval batch (no-grad, greedy) |
+| `--balance_alpha` | `0.01` | Load balancing loss weight |
+| `--z_loss_beta` | `0.001` | Router Z-loss weight |
+| `--num_epochs` | `1` | 3736 steps / `per_device_prompt_batch_size` |
+
+### How it works
+
+Same GRPO algorithm as dense training:
+
+1. **Generate rollouts** — each rank independently generates G=4 rollouts
+   per prompt using `model_engine.module.generate()` (ZeRO-2, full params).
+2. **Reward** — early training uses format bonus (0.1 for `####`, 1.0 for
+   correct) to bootstrap the delimiter; revert to binary after format stabilizes.
+3. **Forward passes** — old policy (no grad), reference model (no grad,
+   offloaded to CPU between uses), new policy (with grad, gradient checkpointed).
+4. **GRPO loss + MoE aux loss** — `balance_alpha × L_balance` added.
+5. **Backward + step** via DeepSpeed ZeRO-2.
+
+### Router design
+
+`TopKRouter` with temperature-scaled softmax: `softmax(logits / 2.0) × k`.
+Weights sum to k (≈2.0), so each selected expert contributes at full strength
+(~1.0×) rather than half (~0.5×), matching the dense FFN output magnitude at
+initialization.
+
 ## Evaluation
 
 Evaluate a trained model on GSM8K (0-shot, official test set) and MMLU (5-shot).
@@ -248,3 +324,13 @@ For GSM8K the script uses the official `gsm8k` test split (not the training val 
 to avoid data leakage. For MMLU it uses 5-shot prompting with examples from the `dev`
 split, and scores each choice by the log-probability of its letter label (A/B/C/D)
 as the next token — equivalent to `lm_eval`'s default MMLU metric.
+
+## Logging
+
+TensorBoard logs are written to `--output_dir/logs`. Launch with:
+
+```bash
+tensorboard --logdir sft/sft_qwen_gsm8k/logs
+tensorboard --logdir grpo/grpo_qwen_gsm8k/logs
+tensorboard --logdir moe/moe_qwen_gsm8k/logs
+```
