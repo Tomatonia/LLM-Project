@@ -218,7 +218,10 @@ def main():
         if dist.get_rank() == 0:
             print(f"Resumed from checkpoint at step {resume_step}")
 
-    global_step = 0
+    start_epoch = resume_step // len(train_loader)
+    global_step = resume_step
+    if args.resume_from_checkpoint and scheduler is not None:
+        scheduler.last_epoch = resume_step
 
     # Baseline eval before any training
     if dist.get_rank() == 0:
@@ -227,14 +230,15 @@ def main():
     if dist.get_rank() == 0:
         print(f"Step 0 | Baseline Validation Loss: {val_loss_0:.4f}")
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         train_sampler.set_epoch(epoch)
         model_engine.train()
+        n_skip = resume_step % len(train_loader) if epoch == start_epoch else 0
+        skipped = 0
 
         for step, batch in enumerate(train_loader):
-            # Skip batches already covered by the resumed checkpoint
-            if global_step < resume_step:
-                global_step += 1
+            if skipped < n_skip:
+                skipped += 1
                 continue
 
             # Move to device (DeepSpeed handles it automatically via model_engine)

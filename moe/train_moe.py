@@ -484,15 +484,17 @@ def train():
             print(f"Resumed at step {resume_step}, epoch {start_epoch + 1}")
 
     # ── Training ────────────────────────────────────────────────────
-    global_step = 0
+    global_step = resume_step
     ds_device = model_engine.device
 
     for epoch in range(start_epoch, args.num_epochs):
         train_sampler.set_epoch(epoch)
+        n_skip = resume_step % len(train_loader) if epoch == start_epoch else 0
+        skipped = 0
 
         for batch in train_loader:
-            if global_step < resume_step and epoch == start_epoch:
-                global_step += 1
+            if skipped < n_skip:
+                skipped += 1
                 continue
 
             prompt_ids = batch["input_ids"].to(ds_device)
