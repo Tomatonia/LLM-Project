@@ -21,12 +21,12 @@ moe/
 ├── moe_layer.py          # MoEBlockWithShared / MoEBlock / convert_to_moe
 ├── convert_dense.py      # Prepare dense model + moe_config.json
 ├── train_moe.py          # GRPO + MoE training script
-├── eval_moe.py           # GSM8K + MMLU evaluation for MoE checkpoints
 ├── diagnostic.py         # Init correctness check (compare vs dense)
 └── ds_config_moe.json    # ZeRO-2, BF16, grad_accum=1
 
 eval/
-└── evaluate.py           # GSM8K + MMLU evaluation (standalone)
+├── eval_moe.py           # GSM8K + MMLU evaluation for MoE checkpoints
+└── evaluate.py           # GSM8K + MMLU evaluation for SFT and GRPO checkpoints
 ```
 
 ## Setup
@@ -311,6 +311,12 @@ python eval/evaluate.py --model_path sft/sft_qwen_gsm8k/final \
 python eval/evaluate.py --model_path sft/sft_qwen_gsm8k/final \
     --benchmark mmlu --mmlu_subjects high_school_mathematics college_mathematics \
     --output_file eval/sft_mmlu_results.json
+
+# MoE model, GSM8K and MMLU tasks
+python eval/eval_moe.py --model_path moe/moe_qwen_gsm8k/final \
+    --base_model moe/qwen_moe_init \
+    --benchmark gsm8k mmlu \
+    --output_file eval/moe_results.json
 ```
 
 ### Benchmarks

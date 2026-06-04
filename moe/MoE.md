@@ -63,7 +63,6 @@ moe/
 ├── moe_layer.py         # MoEBlock / MoEBlockWithShared / convert_to_moe
 ├── convert_dense.py     # Save dense model + moe_config.json
 ├── train_moe.py         # GRPO training loop
-├── eval_moe.py          # Standalone GSM8K + MMLU evaluation
 ├── diagnostic.py        # Quick init correctness check (run on server)
 ├── ds_config_moe.json   # ZeRO-2, BF16, grad_accum=1
 └── MoE.md               # This file
@@ -128,7 +127,7 @@ reward function includes a format bonus during early training:
 Once format stabilizes, revert to binary (0/1) reward and resume from
 checkpoint.
 
-This design was **not** tested in my experiments.
+This design was **not** tested in the experiments.
 
 ## Memory & Design Decisions
 

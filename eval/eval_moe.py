@@ -1,20 +1,19 @@
 """
 Evaluate a trained MoE model on GSM8K and MMLU.
 
-Handles the MoE architecture: loads the dense base model, applies MoE
-conversion from ``moe_config.json``, then loads the trained DeepSpeed
-or HF-format checkpoint weights.
+Loads the dense base model, applies MoE conversion from ``moe_config.json``,
+then loads trained DeepSpeed or HF-format checkpoint weights.
 
 Usage
 -----
     # Evaluate a MoE training checkpoint
-    python moe/eval_moe.py \
+    python eval/eval_moe.py \
         --model_path moe/moe_qwen_gsm8k/final \
         --base_model moe/qwen_moe_init \
         --benchmark gsm8k mmlu
 
-    # Quick sanity check
-    python moe/eval_moe.py \
+    # Quick sanity check (freshly converted model, no training)
+    python eval/eval_moe.py \
         --model_path moe/qwen_moe_init \
         --benchmark gsm8k --gsm8k_max_samples 50
 """
@@ -41,37 +40,25 @@ def load_moe_model(model_path: str, base_model: str):
     """
     Load an MoE model for evaluation.
 
-    *model_path* may be:
-      - A freshly-converted directory (contains ``moe_config.json`` + dense weights)
-      - A DeepSpeed checkpoint from training
-      - An HF-format MoE checkpoint
-
-    *base_model* supplies the dense architecture and tokenizer when
-    *model_path* is a DeepSpeed checkpoint (which lacks both).
+    *model_path* may be a converted directory (contains ``moe_config.json``),
+    a DeepSpeed checkpoint, or an HF-format checkpoint.
+    *base_model* supplies the dense architecture + tokenizer.
     """
-    # Where to find moe_config.json
-    # If model_path = moe_qwen_gsm8k/final, look in the output root
-    # If model_path = qwen_moe_init, look directly there
-    moe_config_path = os.path.join(model_path, "moe_config.json")
-    if not os.path.isfile(moe_config_path):
-        # Check one level up (DeepSpeed checkpoint inside output dir)
-        parent = os.path.dirname(model_path.rstrip("/"))
-        moe_config_path = os.path.join(parent, "moe_config.json")
+    # moe_config.json lives in the base (converted) model directory
+    moe_config_path = os.path.join(base_model, "moe_config.json")
     if not os.path.isfile(moe_config_path):
         raise FileNotFoundError(
-            f"moe_config.json not found at {model_path} or {parent}. "
-            f"Pass --base_model to point to the converted dense directory."
+            f"moe_config.json not found in {base_model}. "
+            f"Run moe/convert_dense.py first."
         )
 
     with open(moe_config_path) as f:
         moe_config = json.load(f)
 
-    # ── Tokenizer from base_model ────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # ── Load dense architecture ──────────────────────────────────────
     print(f"Loading base model from {base_model} ...")
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
@@ -80,11 +67,8 @@ def load_moe_model(model_path: str, base_model: str):
         attn_implementation="flash_attention_2",
         device_map="auto",
     )
-
-    # ── Convert to MoE ───────────────────────────────────────────────
     convert_to_moe(model, moe_config)
 
-    # ── Load trained weights if model_path != base_model ─────────────
     if os.path.normpath(model_path) != os.path.normpath(base_model):
         print(f"Loading trained weights from {model_path} ...")
         if _is_deepspeed_checkpoint(model_path):
@@ -93,11 +77,13 @@ def load_moe_model(model_path: str, base_model: str):
             state_dict = AutoModelForCausalLM.from_pretrained(
                 model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
             ).state_dict()
-            # Filter: only load MoE-relevant keys
             model.load_state_dict(state_dict, strict=False)
 
     model.eval()
-    print("  Model ready.")
+    desc = "shared+MoE" if "shared_intermediate_size" in moe_config else "MoE"
+    n = moe_config["num_experts"]
+    k = moe_config["k"]
+    print(f"  Model ready ({desc}, {n} routed experts, k={k}).")
     return model, tokenizer, moe_config
 
 
@@ -140,7 +126,7 @@ def parse_args():
     p.add_argument("--benchmark", type=str, nargs="+",
                    default=["gsm8k"], choices=["gsm8k", "mmlu"])
     p.add_argument("--gsm8k_max_samples", type=int, default=None)
-    p.add_argument("--gsm8k_batch_size", type=int, default=8)
+    p.add_argument("--gsm8k_batch_size", type=int, default=16)
     p.add_argument("--mmlu_max_per_subject", type=int, default=None)
     p.add_argument("--mmlu_fewshot", type=int, default=5)
     p.add_argument("--max_new_tokens", type=int, default=512)
@@ -157,7 +143,11 @@ def main():
     results = {}
     if "gsm8k" in args.benchmark:
         print("\n" + "=" * 60)
-        print(f"GSM8K  (0-shot, {moe_config['num_experts']} experts, k={moe_config['k']})")
+        has_shared = "shared_intermediate_size" in moe_config
+        desc = f"0-shot, {moe_config['num_experts']} routed experts, k={moe_config['k']}"
+        if has_shared:
+            desc += f", shared={moe_config['shared_intermediate_size']}"
+        print(f"GSM8K  ({desc})")
         print("=" * 60)
         results["gsm8k_accuracy"] = evaluate_gsm8k(
             model, tokenizer,
