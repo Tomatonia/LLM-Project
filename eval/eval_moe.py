@@ -126,7 +126,7 @@ def parse_args():
     p.add_argument("--benchmark", type=str, nargs="+",
                    default=["gsm8k"], choices=["gsm8k", "mmlu"])
     p.add_argument("--gsm8k_max_samples", type=int, default=None)
-    p.add_argument("--gsm8k_batch_size", type=int, default=16)
+    p.add_argument("--gsm8k_batch_size", type=int, default=64)
     p.add_argument("--mmlu_max_per_subject", type=int, default=None)
     p.add_argument("--mmlu_fewshot", type=int, default=5)
     p.add_argument("--max_new_tokens", type=int, default=512)

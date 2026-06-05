@@ -180,8 +180,7 @@ def grpo_loss(new_logprobs, old_logprobs, ref_logprobs, advantages, response_mas
     n_tokens = mask.sum().clamp(min=1)
 
     kl_per_token = new_logprobs - ref_logprobs
-    ratio_ref = torch.exp(kl_per_token)
-    kl_per_token = kl_per_token + 1.0 / ratio_ref - 1.0
+    kl_per_token = kl_per_token + torch.exp(-kl_per_token) - 1.0
 
     loss = ((policy_loss * mask).sum()
             + kl_coef * torch.clamp((kl_per_token * mask).sum(), min=0.0)) / n_tokens
@@ -190,7 +189,7 @@ def grpo_loss(new_logprobs, old_logprobs, ref_logprobs, advantages, response_mas
         clipped_frac = ((ratio_old < 1.0 - clip_epsilon) | (ratio_old > 1.0 + clip_epsilon)).float()
         stats = {
             "policy_loss": (policy_loss * mask).sum() / n_tokens,
-            "kl_divergence": (new_logprobs - ref_logprobs).sum() / n_tokens,
+            "kl_divergence": (kl_per_token * mask).sum() / n_tokens,
             "clipped_fraction": (clipped_frac * mask).sum() / n_tokens,
         }
     return loss, stats
@@ -329,7 +328,7 @@ def parse_args():
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--group_size", type=int, default=4)
     p.add_argument("--clip_epsilon", type=float, default=0.2)
-    p.add_argument("--kl_coef", type=float, default=0.04)
+    p.add_argument("--kl_coef", type=float, default=0.08)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--per_device_prompt_batch_size", type=int, default=4)
