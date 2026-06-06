@@ -62,7 +62,7 @@ class TopKRouter(nn.Module):
         # Temperature-scaled softmax: keeps weights ~(1.0, 1.0)
         # at init while logit variance still breaks top-k ties
         # differently per token (so all experts get used).
-        topk_weights = F.softmax(topk_vals / 2.0, dim=-1) * k   # (N, k)
+        topk_weights = F.softmax(topk_vals / 2.0, dim=-1)       # (N, k)
 
         # ── Capacity ──────────────────────────────────────────────
         capacity = max(1, int(self.capacity_factor * N * k / E))

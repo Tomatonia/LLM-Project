@@ -1,6 +1,6 @@
 # LLM-Project
 
-Final project for the LLM Applications course (2026 spring semester). Fine-tuning language models on mathematical reasoning tasks.
+Final project for the LLM Applications course (2026 spring semester). Post-training language models on mathematical reasoning tasks (GSM8K dataset), using SFT, GRPO methods, and MoE architecutres.
 
 ## Structure
 
@@ -20,7 +20,10 @@ moe/
 ├── router.py             # TopKRouter with temperature-scaled softmax
 ├── moe_layer.py          # MoEBlockWithShared / MoEBlock / convert_to_moe
 ├── convert_dense.py      # Prepare dense model + moe_config.json
-├── train_moe.py          # GRPO + MoE training script
+├── train_moe_sft.py      # Stage 1: SFT (frozen attn + non-MoE FFN)
+├── train_moe.py          # Stage 2: GRPO (all layers unfrozen)
+├── plot_metrics.py       # Plot GRPO reward + accuracy curves
+├── plot_sft_metrics.py   # Plot SFT train + validation loss curves
 ├── diagnostic.py         # Init correctness check (compare vs dense)
 └── ds_config_moe.json    # ZeRO-2, BF16, grad_accum=1
 
@@ -217,21 +220,29 @@ python grpo/plot_metrics.py --smooth 0
 
 ## MoE Training
 
-Mixture-of-Experts GRPO training replaces half the dense FFN layers in
+Mixture-of-Experts training replaces half the dense FFN layers in
 `Qwen/Qwen2.5-1.5B` with shared+routed MoE blocks (1 shared expert + 3 routed,
-top-2 gating).  Custom dispatch/combine with partitioned weight initialization
+top-2 gating). Custom dispatch/combine with partitioned weight initialization
 for proper ZeRO-2 integration.
 
+Training is a **two-stage** pipeline: first SFT with only MoE layers trainable
+(attention and non-MoE FFN frozen), then GRPO with all layers unfrozen.
+
 ```bash
-# 1. Convert the dense model (saves dense weights + moe_config.json)
+# 0. Convert the dense model (saves dense weights + moe_config.json)
 python -m moe.convert_dense \
     --model_path Qwen/Qwen2.5-1.5B \
     --output moe/qwen_moe_init
 
-# 2. Train MoE with GRPO
+# 1. Stage 1: SFT (frozen attention + non-MoE FFN, ~2 epochs)
+deepspeed --num_gpus=2 moe/train_moe_sft.py \
+    --deepspeed_config moe/ds_config_moe.json
+
+# 2. Stage 2: GRPO (all layers unfrozen, resume from Stage 1)
 deepspeed --num_gpus=2 moe/train_moe.py \
     --model_path moe/qwen_moe_init \
-    --output_dir moe/moe_qwen_gsm8k \
+    --resume_from_checkpoint moe/moe_sft_gsm8k/final \
+    --no-load_optimizer_states \
     --deepspeed_config moe/ds_config_moe.json
 
 # 3. Evaluate
@@ -245,50 +256,89 @@ python moe/eval_moe.py \
 
 14 of 28 transformer layers (every other, starting from layer 1) have their
 `Qwen2MLP` replaced with an `MoEBlockWithShared`: one shared expert (4096 dims,
-always active) + 3 routed experts (3072 dims each, top-2 gating).  The shared
+always active) + 3 routed experts (3072 dims each, top-2 gating). The shared
 expert covers dense-FFN dims [0, 4096) at full strength on every token; the 3
 routed experts partition the remaining dims with staggered overlapping slices.
 
 Total: ~1.83B params, fits 2×24 GB GPUs under ZeRO-2 (~21 GB peak at batch
-size 4).  For lower memory, reduce `--per_device_prompt_batch_size`.
+size 4). For lower memory, reduce `--per_device_prompt_batch_size`.
 
-### DeepSpeed configuration
+### Stage 1: SFT with frozen layers
 
-ZeRO Stage 2, BF16, no CPU offload, `gradient_accumulation_steps: 1`.
-ZeRO-2 keeps full params per GPU — no `GatheredParameters` or weight
-syncing needed.  Generation, forward passes, and backward all work directly.
+In Stage 1, all attention, non-MoE FFN, embeddings, lm_head, and layer norms
+are frozen. Only the MoE routers + experts (shared and routed) are trainable
+(~30% of total parameters). This trains the MoE components to perform the
+mathematical reasoning task while preserving the dense pretrained representations.
 
-### Key arguments
+Uses standard cross-entropy SFT loss with prompt-token masking (same format as
+the dense SFT script). MoE auxiliary losses (load-balancing + router Z-loss)
+are added with gradient support to prevent router collapse.
+
+```bash
+deepspeed --num_gpus=2 moe/train_moe_sft.py \
+    --per_device_train_batch_size 4 \
+    --deepspeed_config moe/ds_config_moe.json
+```
+
+#### Key arguments (Stage 1)
 
 | Argument | Default | Description |
 |---|---|---|
 | `--model_path` | `moe/qwen_moe_init` | Converted model directory |
+| `--num_epochs` | `2` | Number of training epochs |
+| `--learning_rate` | `2e-5` | Peak learning rate |
+| `--warmup_steps` | `100` | LR warmup steps |
+| `--per_device_train_batch_size` | `4` | Micro batch size per GPU |
+| `--max_length` | `1024` | Max tokenized sequence length |
+| `--output_dir` | `moe/moe_sft_gsm8k` | Checkpoint and log directory |
+| `--balance_alpha` | `0.01` | Load balancing loss weight |
+| `--z_loss_beta` | `0.001` | Router Z-loss weight |
+| `--logging_steps` | `10` | Log train loss every N iterations |
+| `--eval_steps` | `100` | Run validation every N iterations |
+| `--save_steps` | `500` | Save checkpoint every N iterations |
+
+### Stage 2: GRPO with all layers unfrozen
+
+Stage 2 resumes from a Stage 1 SFT checkpoint, unfreezes all layers, and
+trains with GRPO. The `--no-load_optimizer_states` flag is required because the
+Stage 1 optimizer state only covers the frozen subset of parameters.
+
+```bash
+deepspeed --num_gpus=2 moe/train_moe.py \
+    --model_path moe/qwen_moe_init \
+    --resume_from_checkpoint moe/moe_sft_gsm8k/final \
+    --resume_step 0 \
+    --no-load_optimizer_states \
+    --deepspeed_config moe/ds_config_moe.json
+```
+
+#### Key arguments (Stage 2)
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model_path` | `moe/qwen_moe_init` | Converted model directory (for moe_config.json) |
+| `--resume_from_checkpoint` | — | Path to Stage 1 checkpoint |
+| `--no-load_optimizer_states` | — | Skip optimizer state (required across stages) |
 | `--per_device_prompt_batch_size` | `4` | Prompts per GPU per step |
+| `--group_size` | `4` | G: responses sampled per prompt |
 | `--temperature` | `1.0` | Rollout sampling temperature |
 | `--eval_batch_size` | `16` | GSM8K eval batch (no-grad, greedy) |
 | `--balance_alpha` | `0.01` | Load balancing loss weight |
 | `--z_loss_beta` | `0.001` | Router Z-loss weight |
-| `--num_epochs` | `1` | 3736 steps / `per_device_prompt_batch_size` |
+| `--num_epochs` | `1` | Number of GRPO epochs |
 
-### How it works
+### DeepSpeed configuration
 
-Same GRPO algorithm as dense training:
-
-1. **Generate rollouts** — each rank independently generates G=4 rollouts
-   per prompt using `model_engine.module.generate()` (ZeRO-2, full params).
-2. **Reward** — early training uses format bonus (0.1 for `####`, 1.0 for
-   correct) to bootstrap the delimiter; revert to binary after format stabilizes.
-3. **Forward passes** — old policy (no grad), reference model (no grad,
-   offloaded to CPU between uses), new policy (with grad, gradient checkpointed).
-4. **GRPO loss + MoE aux loss** — `balance_alpha × L_balance` added.
-5. **Backward + step** via DeepSpeed ZeRO-2.
+ZeRO Stage 2, BF16, no CPU offload. Gradient accumulation is handled by the
+DeepSpeed config (`gradient_accumulation_steps: 1` in `ds_config_moe.json`),
+not the training script. ZeRO-2 keeps full params per GPU — `generate()`
+works directly without weight gathering.
 
 ### Router design
 
-`TopKRouter` with temperature-scaled softmax: `softmax(logits / 2.0) × k`.
-Weights sum to k (≈2.0), so each selected expert contributes at full strength
-(~1.0×) rather than half (~0.5×), matching the dense FFN output magnitude at
-initialization.
+`TopKRouter` with temperature-scaled softmax: `softmax(logits / 2.0)`.
+Weights are standard softmax-normalised (sum to 1.0), giving each selected
+expert a calibrated contribution weight.
 
 ## Evaluation
 
@@ -338,5 +388,6 @@ TensorBoard logs are written to `--output_dir/logs`. Launch with:
 ```bash
 tensorboard --logdir sft/sft_qwen_gsm8k/logs
 tensorboard --logdir grpo/grpo_qwen_gsm8k/logs
-tensorboard --logdir moe/moe_qwen_gsm8k/logs
+tensorboard --logdir moe/moe_sft_gsm8k/logs       # Stage 1 SFT
+tensorboard --logdir moe/moe_qwen_gsm8k/logs      # Stage 2 GRPO
 ```

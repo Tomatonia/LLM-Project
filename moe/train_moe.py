@@ -1,15 +1,28 @@
 """
-GRPO training with Mixture-of-Experts on GSM8K.
+Stage 2: GRPO training with Mixture-of-Experts (all layers unfrozen).
 
 Adapted from grpo/train_grpo.py.  The model must be pre-converted with
 ``moe/convert_dense.py`` before training.
 
-Usage
------
-    # 1. Convert the dense model
+Typical two-stage pipeline
+--------------------------
+    # 0. Convert the dense model
     python -m moe.convert_dense --model_path Qwen/Qwen2.5-1.5B --output ./qwen_moe_init
 
-    # 2. Train MoE with GRPO
+    # 1. Stage 1: SFT (frozen attention + non-MoE FFN)
+    deepspeed --num_gpus=2 moe/train_moe_sft.py \
+        --deepspeed_config moe/ds_config_moe.json
+
+    # 2. Stage 2: GRPO (all layers unfrozen, reloads Stage 1 weights)
+    deepspeed --num_gpus=2 moe/train_moe.py \
+        --model_path moe/qwen_moe_init \
+        --resume_from_checkpoint moe/moe_sft_gsm8k/final \
+        --resume_step 0 \
+        --no-load_optimizer_states \
+        --deepspeed_config moe/ds_config_moe.json
+
+Standalone (skip Stage 1)
+-------------------------
     deepspeed --num_gpus=2 moe/train_moe.py \
         --deepspeed_config moe/ds_config_moe.json
 """
@@ -42,6 +55,24 @@ from transformers import get_linear_schedule_with_warmup
 from datasets import load_dataset
 
 from moe.moe_layer import collect_aux_losses, convert_to_moe
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Layer unfreezing (for Stage 2 after SFT)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def unfreeze_all_layers(model):
+    """Ensure all parameters are trainable.
+
+    Called at the start of Stage 2 (GRPO) in case the model was loaded from
+    a Stage 1 (SFT) checkpoint where attention and non-MoE FFN were frozen.
+    """
+    for p in model.parameters():
+        p.requires_grad_(True)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"All layers unfrozen. Trainable: {trainable:,} / {total:,} params "
+          f"({100 * trainable / total:.1f}%)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -328,7 +359,7 @@ def parse_args():
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--group_size", type=int, default=4)
     p.add_argument("--clip_epsilon", type=float, default=0.2)
-    p.add_argument("--kl_coef", type=float, default=0.08)
+    p.add_argument("--kl_coef", type=float, default=0.04)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--per_device_prompt_batch_size", type=int, default=4)
@@ -342,6 +373,11 @@ def parse_args():
     p.add_argument("--eval_steps", type=int, default=100)
     p.add_argument("--save_steps", type=int, default=500)
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
+    p.add_argument("--load_optimizer_states", action=argparse.BooleanOptionalAction, default=True,
+                   help="Load optimizer states from checkpoint. "
+                        "Use --no-load_optimizer_states when resuming from "
+                        "Stage 1 SFT checkpoint (different frozen param set).")
+    p.add_argument("--resume_step", type=int, default=None)
     p.add_argument("--balance_alpha", type=float, default=0.01,
                    help="Weight of MoE load-balancing auxiliary loss")
     p.add_argument("--z_loss_beta", type=float, default=0.001,
@@ -418,6 +454,9 @@ def train():
     model = convert_to_moe(model, moe_config)
     _mem("after moe conversion", rank)
 
+    # Stage 2 trains ALL parameters — undo any freezing from Stage 1 checkpoint
+    unfreeze_all_layers(model)
+
     model.gradient_checkpointing_enable()
     model.train()
 
@@ -471,11 +510,15 @@ def train():
         else:
             load_dir, tag = ckpt_path, None
         if rank == 0:
-            print(f"Loading checkpoint: load_dir={load_dir}, tag={tag or '(latest)'}")
-        _, client_state = model_engine.load_checkpoint(load_dir, tag=tag)
+            print(f"Loading checkpoint: load_dir={load_dir}, tag={tag or '(latest)'}"
+                  f"  optimizer_states={args.load_optimizer_states}")
+        _, client_state = model_engine.load_checkpoint(
+            load_dir, tag=tag,
+            load_optimizer_states=args.load_optimizer_states,
+        )
         if client_state is None:
             raise RuntimeError(f"Failed to load checkpoint from {ckpt_path}")
-        resume_step = client_state.get("global_step", 0)
+        resume_step = client_state.get("global_step", 0) if args.resume_step is None else args.resume_step
         start_epoch = resume_step // len(train_loader)
         if scheduler is not None:
             scheduler.last_epoch = resume_step

@@ -73,15 +73,22 @@ class MoEBlockWithShared(nn.Module):
 
         y = y.view(B, S, D)
 
+        bl = load_balance_loss(rp, dm)
+        zl = router_z_loss(self.router.gate(x_flat))
         self._aux = {
-            "balance_loss": load_balance_loss(rp, dm).detach(),
-            "z_loss": router_z_loss(self.router.gate(x_flat)).detach(),
+            "balance_loss": bl.detach(),
+            "z_loss": zl.detach(),
+            "dropped_frac": torch.tensor(df, device=x.device),
+        }
+        self._aux_grad = {
+            "balance_loss": bl,
+            "z_loss": zl,
             "dropped_frac": torch.tensor(df, device=x.device),
         }
         return y
 
-    def get_aux_losses(self):
-        return self._aux
+    def get_aux_losses(self, grad: bool = False):
+        return self._aux_grad if grad else self._aux
 
     def init_from_dense(self, dense_ffn: nn.Module, noise_std: float = 0.0):
         d_is = dense_ffn.gate_proj.out_features
@@ -151,15 +158,22 @@ class MoEBlock(nn.Module):
 
         y = y.view(B, S, D)
 
+        bl = load_balance_loss(rp, dm)
+        zl = router_z_loss(self.router.gate(x_flat))
         self._aux = {
-            "balance_loss": load_balance_loss(rp, dm).detach(),
-            "z_loss": router_z_loss(self.router.gate(x_flat)).detach(),
+            "balance_loss": bl.detach(),
+            "z_loss": zl.detach(),
+            "dropped_frac": torch.tensor(df, device=x.device),
+        }
+        self._aux_grad = {
+            "balance_loss": bl,
+            "z_loss": zl,
             "dropped_frac": torch.tensor(df, device=x.device),
         }
         return y
 
-    def get_aux_losses(self):
-        return self._aux
+    def get_aux_losses(self, grad: bool = False):
+        return self._aux_grad if grad else self._aux
 
     def init_from_dense(self, dense_ffn: nn.Module, noise_std: float = 0.0):
         e_is = self.experts[0].gate_proj.out_features
@@ -237,13 +251,13 @@ def _copy_wrapped_slice(expert, dense_ffn, start, end, boundary, d_is, e_is, noi
 # Aux-loss collection
 # ═══════════════════════════════════════════════════════════════════════════
 
-def collect_aux_losses(model) -> dict[str, torch.Tensor]:
+def collect_aux_losses(model, grad: bool = False) -> dict[str, torch.Tensor]:
     balances, zs, drops = [], [], []
     for layer in model.model.layers:
         moe = layer.mlp
         if not hasattr(moe, "get_aux_losses"):
             continue
-        aux = moe.get_aux_losses()
+        aux = moe.get_aux_losses(grad=grad)
         balances.append(aux["balance_loss"])
         zs.append(aux["z_loss"])
         drops.append(aux["dropped_frac"])
