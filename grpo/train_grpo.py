@@ -246,7 +246,7 @@ def grpo_loss(
         # Report the unclamped estimate for monitoring
         stats = {
             "policy_loss": (policy_loss * mask).sum() / n_tokens,
-            "kl_divergence": kl_per_token.sum() / n_tokens,
+            "kl_divergence": (kl_per_token * mask).sum() / n_tokens,
             "clipped_fraction": (clipped_frac * mask).sum() / n_tokens,
         }
     return loss, stats
