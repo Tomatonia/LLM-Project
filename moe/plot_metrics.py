@@ -16,7 +16,7 @@ import numpy as np
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 
-def load_scalars(logdir: str, tags: list[str]) -> dict[str, tuple[list[int], list[float]]]:
+def load_scalars(logdir: str, tags: list[str], max_steps=None) -> dict[str, tuple[list[int], list[float]]]:
     acc = EventAccumulator(logdir)
     acc.Reload()
     result = {}
@@ -28,7 +28,8 @@ def load_scalars(logdir: str, tags: list[str]) -> dict[str, tuple[list[int], lis
         # Deduplicate by step — resume can write overlapping steps; keep last
         seen: dict[int, float] = {}
         for e in events:
-            seen[e.step] = e.value
+            if max_steps is not None and e.step <= max_steps:
+                seen[e.step] = e.value
         steps = sorted(seen.keys())
         result[tag] = (steps, [seen[s] for s in steps])
     return result
@@ -105,6 +106,7 @@ def parse_args():
     p.add_argument("--logdir", type=str, default="moe/moe_qwen_gsm8k/logs")
     p.add_argument("--output", type=str, default=None)
     p.add_argument("--smooth", type=float, default=0.6)
+    p.add_argument("--max_steps", type=int, default=None)
     p.add_argument("--tags", type=str, nargs="+",
                    default=["train/mean_reward", "eval/gsm8k_accuracy"])
     p.add_argument("--title", type=str, default="GRPO Training on GSM8K")
@@ -117,7 +119,7 @@ def main():
         args.output = os.path.join(
             os.path.dirname(args.logdir.rstrip("/")), "grpo_metrics.png"
         )
-    data = load_scalars(args.logdir, args.tags)
+    data = load_scalars(args.logdir, args.tags, args.max_steps)
     if not data:
         print(f"No matching tags found in {args.logdir}")
         return

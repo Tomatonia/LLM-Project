@@ -246,10 +246,11 @@ deepspeed --num_gpus=2 moe/train_moe.py \
     --deepspeed_config moe/ds_config_moe.json
 
 # 3. Evaluate
-python moe/eval_moe.py \
+python eval/eval_moe.py \
     --model_path moe/moe_qwen_gsm8k/final \
     --base_model moe/qwen_moe_init \
-    --benchmark gsm8k mmlu
+    --benchmark gsm8k mmlu \
+    --output_file eval/moe_results.json
 ```
 
 ### Architecture
